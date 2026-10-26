@@ -20,6 +20,7 @@ from posixpath import join as posix_join
 from os.path import join as os_join
 
 from MAST_tools.utils.data_utils import ShotInfo, BaseDataSourceType, ZarrStoreType, ZarrFSStoreType, ShotInfoType
+from MAST_tools.utils.zip_store import PrefixedZipStore, TarMemberZipStore, load_tar_index
 from MAST_tools.utils.general_utils import get_random_string, warning_print
 from MAST_tools.utils.path_utils import DEFAULT_SIGNAL_AVAILABILITY_FILE
 
@@ -195,7 +196,9 @@ class MASTStorageManager:
                     f"creation of the MASTStorageManager instance, does not correspond to a valid local directory."
                 )
             else:
-                zarr_files = [file_ for file_ in os.listdir(self.base_local_zarr_path) if file_.endswith(".zarr")]
+                zarr_files = [
+                    file_ for file_ in os.listdir(self.base_local_zarr_path) if file_.endswith((".zarr", ".zarr.zip"))
+                ]
                 if len(zarr_files):
                     print(
                         f"[INFO] Local Zarr database identified under `{self.base_local_zarr_path}` with "
@@ -509,8 +512,11 @@ class MASTStorageManager:
             ]
 
         raw_shot_ids = [
-            filename.split("/")[-1].split(".zarr")[0] for filename in all_filenames if filename.endswith(".zarr")
+            filename.split("/")[-1].split(".zarr")[0]
+            for filename in all_filenames
+            if filename.endswith((".zarr", ".zarr.zip"))
         ]
+        raw_shot_ids = list(dict.fromkeys(raw_shot_ids))  # dedupe if both .zarr and .zarr.zip exist
 
         shot_ids = [int(raw_shot_id) for raw_shot_id in raw_shot_ids if self._is_digit(raw_shot_id)]
         shot_ids.sort()
@@ -680,8 +686,7 @@ class MASTStorageManager:
         parsed_shot_info = self._parse_shot_info_dict(shot_info=shot_info)
         if parsed_shot_info["local"]:
             self._validate_base_local_zarr_path()
-            zarr_file_path = os_join(str(self.base_local_zarr_path), f"{parsed_shot_info['shot_id']}.zarr")
-            store = zarr.storage.LocalStore(root=zarr_file_path)
+            store = self._make_local_store(parsed_shot_info["shot_id"])
 
         else:
             zarr_file_path = posix_join(self.s3_mast_dataset_path, f"{parsed_shot_info['shot_id']}.zarr")
@@ -692,6 +697,21 @@ class MASTStorageManager:
             print(f"{store_type} store for shot {parsed_shot_info['shot_id']} created.")
 
         return store
+
+    # ------------------------------------------------------------------------------------------------------------------
+    def _make_local_store(self, shot_id):
+        """Local store for a shot. Lookup order: `<shot>.zarr` dir, `<shot>.zarr.zip`, then a zip inside a tar batch
+        via `<base>/mast_tar_index.json` (built by tokamark_workspace/build_mast_tar_index.py)."""
+        dir_path = os_join(str(self.base_local_zarr_path), f"{shot_id}.zarr")
+        if os.path.isdir(dir_path):
+            return zarr.storage.LocalStore(root=dir_path, read_only=True)
+        zip_path = dir_path + ".zip"
+        if os.path.isfile(zip_path):
+            return PrefixedZipStore(zip_path, prefix=f"{shot_id}.zarr")
+        entry = load_tar_index(self.base_local_zarr_path).get(str(shot_id))
+        if entry is not None:
+            return TarMemberZipStore(entry[0], entry[1], entry[2], prefix=f"{shot_id}.zarr")
+        raise FileNotFoundError(f"Shot {shot_id}: no {dir_path}, {zip_path}, or mast_tar_index.json entry.")
 
     # ------------------------------------------------------------------------------------------------------------------
     def make_shot_group(self, data_origin: BaseDataSourceType, verbose: bool = False) -> zarr.Group:
@@ -728,9 +748,7 @@ class MASTStorageManager:
                 self._validate_base_local_zarr_path()
 
                 # Create group by implicitly creating a writable LocalStore
-                local_path = os_join(str(self.base_local_zarr_path), f"{parsed_shot_info['shot_id']}.zarr")
-
-                group = zarr.open_group(store=local_path, mode="r")
+                group = zarr.open_group(store=self._make_local_store(parsed_shot_info["shot_id"]), mode="r")
                 # Source: https://zarr.readthedocs.io/en/latest/user-guide/storage.html#implicit-store-creation
             else:
                 # Create group by implicitly creating a read-only FsspecStore
